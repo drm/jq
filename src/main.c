@@ -179,7 +179,7 @@ static FILE* maybe_open_outfile(FILE *current_fout, const char* outfile) {
   FILE *ret = current_fout;
   if (!current_fout) {
     if (outfile) {
-      ret = fopen(outfile, "w+");
+      ret = fopen(outfile, "w");
     } else {
       ret = stdout;
     }
