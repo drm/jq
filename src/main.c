@@ -81,6 +81,7 @@ static void usage(int code, int keep_it_short) {
       "  -M               monochrome (don't colorize JSON);\n"
       "  -S               sort keys of objects on output;\n"
       "  --tab            use tabs for indentation;\n"
+      "  --outfile f      write result JSON to file <f>;\n"
       "  --arg a v        set variable $a to value <v>;\n"
       "  --argjson a v    set variable $a to JSON value <v>;\n"
       "  --slurpfile a f  set variable $a to an array of JSON texts read from <f>;\n"
@@ -174,16 +175,28 @@ static const char *skip_shebang(const char *p) {
   return n+1;
 }
 
-static int process(jq_state *jq, jv value, int flags, int dumpopts) {
+static FILE* maybe_open_outfile(FILE *current_fout, const char* outfile) {
+  FILE *ret = current_fout;
+  if (!current_fout) {
+    if (outfile) {
+      ret = fopen(outfile, "w+");
+    } else {
+      ret = stdout;
+    }
+  }
+  return ret;
+}
+
+static int process(jq_state *jq, jv value, int flags, FILE *fout, int dumpopts) {
   int ret = JQ_OK_NO_OUTPUT; // No valid results && -e -> exit(4)
   jq_start(jq, value, flags);
   jv result;
   while (jv_is_valid(result = jq_next(jq))) {
     if ((options & RAW_OUTPUT) && jv_get_kind(result) == JV_KIND_STRING) {
       if (options & ASCII_OUTPUT) {
-        jv_dumpf(jv_copy(result), stdout, JV_PRINT_ASCII);
+        jv_dumpf(jv_copy(result), fout, JV_PRINT_ASCII);
       } else {
-        fwrite(jv_string_value(result), 1, jv_string_length_bytes(jv_copy(result)), stdout);
+        fwrite(jv_string_value(result), 1, jv_string_length_bytes(jv_copy(result)), fout);
       }
       ret = JQ_OK;
       jv_free(result);
@@ -193,15 +206,15 @@ static int process(jq_state *jq, jv value, int flags, int dumpopts) {
       else
         ret = JQ_OK;
       if (options & SEQ)
-        priv_fwrite("\036", 1, stdout, dumpopts & JV_PRINT_ISATTY);
-      jv_dump(result, dumpopts);
+        priv_fwrite("\036", 1, fout, dumpopts & JV_PRINT_ISATTY);
+      jv_dumpf(result, fout, dumpopts);
     }
     if (!(options & RAW_NO_LF))
-      priv_fwrite("\n", 1, stdout, dumpopts & JV_PRINT_ISATTY);
+      priv_fwrite("\n", 1, fout, dumpopts & JV_PRINT_ISATTY);
     if (options & RAW_NUL)
-      priv_fwrite("\0", 1, stdout, dumpopts & JV_PRINT_ISATTY);
+      priv_fwrite("\0", 1, fout, dumpopts & JV_PRINT_ISATTY);
     if (options & UNBUFFERED_OUTPUT)
-      fflush(stdout);
+      fflush(fout);
   }
   if (jq_halted(jq)) {
     // jq program invoked `halt` or `halt_error`
@@ -300,6 +313,7 @@ int main(int argc, char* argv[]) {
 
   int dumpopts = JV_PRINT_INDENT_FLAGS(2);
   const char* program = 0;
+  const char* outfile = 0;
 
   jq_util_input_state *input_state = jq_util_input_init(NULL, NULL); // XXX add err_cb
 
@@ -519,6 +533,16 @@ int main(int argc, char* argv[]) {
         i += 2; // skip the next two arguments
         continue;
       }
+      if (isoption(argv[i], 'o', "outfile", &short_opts)) {
+        if (i >= argc - 1) {
+          fprintf(stderr, "%s: --outfile takes a parameter (e.g. '--outfile OUTFILE' or '-o OUTFILE')\n", progname);
+          die();
+        }
+	// we need to postpone opening the outfile until after all input is read.
+	outfile = argv[i+1];
+        i++; // skip the argument
+        continue;
+      }
       if (isoption(argv[i],  0,  "debug-dump-disasm", &short_opts)) {
         options |= DUMP_DISASM;
         continue;
@@ -558,29 +582,38 @@ int main(int argc, char* argv[]) {
     }
   }
 
+
+  if (outfile) {
+    dumpopts &= ~JV_PRINT_COLOR;
+    dumpopts &= ~JV_PRINT_ISATTY;
+  } else {
 #ifdef USE_ISATTY
-  if (isatty(STDOUT_FILENO)) {
+    if (isatty(STDOUT_FILENO)) {
 #ifndef WIN32
-    dumpopts |= JV_PRINT_ISATTY | JV_PRINT_COLOR;
+      dumpopts |= JV_PRINT_ISATTY | JV_PRINT_COLOR;
 #else
   /* Verify we actually have the console, as the NUL device is also regarded as
      tty.  Windows can handle color if ANSICON (or ConEmu) is installed, or
      Windows 10 supports the virtual terminal */
-    DWORD mode;
-    HANDLE con = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (GetConsoleMode(con, &mode)) {
-      dumpopts |= JV_PRINT_ISATTY;
-      if (getenv("ANSICON") != NULL ||
-          SetConsoleMode(con, mode | 4/*ENABLE_VIRTUAL_TERMINAL_PROCESSING*/))
-        dumpopts |= JV_PRINT_COLOR;
+      DWORD mode;
+      HANDLE con = GetStdHandle(STD_OUTPUT_HANDLE);
+      if (GetConsoleMode(con, &mode)) {
+        dumpopts |= JV_PRINT_ISATTY;
+        if (getenv("ANSICON") != NULL ||
+            SetConsoleMode(con, mode | 4/*ENABLE_VIRTUAL_TERMINAL_PROCESSING*/))
+          dumpopts |= JV_PRINT_COLOR;
+      }
+#endif
     }
 #endif
-  }
-#endif
+    
+    if (options & COLOR_OUTPUT) dumpopts |= JV_PRINT_COLOR;
+    if (options & NO_COLOR_OUTPUT) dumpopts &= ~JV_PRINT_COLOR;
+
+  } 
+  
   if (options & SORTED_OUTPUT) dumpopts |= JV_PRINT_SORTED;
   if (options & ASCII_OUTPUT) dumpopts |= JV_PRINT_ASCII;
-  if (options & COLOR_OUTPUT) dumpopts |= JV_PRINT_COLOR;
-  if (options & NO_COLOR_OUTPUT) dumpopts &= ~JV_PRINT_COLOR;
 
   if (getenv("JQ_COLORS") != NULL && !jq_set_colors(getenv("JQ_COLORS")))
       fprintf(stderr, "Failed to set $JQ_COLORS\n");
@@ -669,14 +702,19 @@ int main(int argc, char* argv[]) {
   if (nfiles == 0)
     jq_util_input_add_input(input_state, "-");
 
+  // Delay opening of output file until after first input is read. This way we can write to the same file as is read on input. [#105] 
+  FILE *fout = 0;
+  
   if (options & PROVIDE_NULL) {
-    ret = process(jq, jv_null(), jq_flags, dumpopts);
+    fout = maybe_open_outfile(fout, outfile);
+    ret = process(jq, jv_null(), jq_flags, fout, dumpopts);
   } else {
     jv value;
     while (jq_util_input_errors(input_state) == 0 &&
            (jv_is_valid((value = jq_util_input_next_input(input_state))) || jv_invalid_has_msg(jv_copy(value)))) {
       if (jv_is_valid(value)) {
-        ret = process(jq, value, jq_flags, dumpopts);
+        fout = maybe_open_outfile(fout, outfile);
+        ret = process(jq, value, jq_flags, fout, dumpopts);
         if (ret <= 0 && ret != JQ_OK_NO_OUTPUT)
           last_result = (ret != JQ_OK_NULL_KIND);
         continue;
@@ -700,8 +738,8 @@ int main(int argc, char* argv[]) {
     ret = JQ_ERROR_SYSTEM;
 
 out:
-  badwrite = ferror(stdout);
-  if (fclose(stdout)!=0 || badwrite) {
+  badwrite = ferror(fout);
+  if (fclose(fout)!=0 || badwrite) {
     fprintf(stderr,"jq: error: writing output failed: %s\n", strerror(errno));
     ret = JQ_ERROR_SYSTEM;
   }
